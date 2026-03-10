@@ -15,7 +15,7 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${RESULT_DIR}/cpu_stress_$(hostname -s)_${TIMESTAMP}.log"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-DURATION=1800           # seconds (30 min); override with -d
+DURATION=14400          # seconds (4 hours); override with -d
 CPU_METHOD="matrixprod" # stress-ng cpu method; override with -m
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
