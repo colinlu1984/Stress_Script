@@ -219,7 +219,25 @@ find_storcli() {
 }
 
 install_storcli() {
-    log_info "storcli64 not found — downloading from Broadcom..."
+    # ── Step 1: look for a local package in the same directory as this script ──
+    # Supported layouts (place either file next to disk_stress.sh):
+    #   storcli-*.noarch.rpm   (Rocky / RHEL)
+    #   storcli_*_all.deb      (Ubuntu / Debian)
+    local local_pkg=""
+    if [[ "$OS_FAMILY" == "rpm" ]]; then
+        local_pkg=$(find "$SCRIPT_DIR" -maxdepth 1 -name "storcli-*.noarch.rpm" | head -1)
+    else
+        local_pkg=$(find "$SCRIPT_DIR" -maxdepth 1 -name "storcli_*_all.deb"    | head -1)
+    fi
+
+    if [[ -n "$local_pkg" ]]; then
+        log_info "Found local storcli package: ${local_pkg}"
+        _install_storcli_pkg "$local_pkg"
+        return
+    fi
+
+    # ── Step 2: fall back to downloading from Broadcom ────────────────────────
+    log_info "No local package found — downloading from Broadcom..."
 
     if ! command -v wget &>/dev/null && ! command -v curl &>/dev/null; then
         log_error "Neither wget nor curl is available. Install one first:
@@ -234,7 +252,6 @@ install_storcli() {
 
     local tmpdir
     tmpdir=$(mktemp -d)
-    # Ensure temp directory is cleaned up on exit
     trap 'rm -rf "$tmpdir"' EXIT
 
     log_info "Downloading storcli package (~30 MB)..."
@@ -250,7 +267,7 @@ install_storcli() {
     unzip -q "${tmpdir}/storcli.zip" -d "${tmpdir}" \
         || log_error "Failed to extract storcli ZIP."
 
-    # The ZIP may be a single-file archive wrapping the real content
+    # The outer ZIP may contain a second ZIP with the actual OS packages
     local inner_zip
     inner_zip=$(find "${tmpdir}" -name "Unified_storcli_all_os.zip" | head -1)
     if [[ -n "$inner_zip" ]]; then
@@ -258,22 +275,34 @@ install_storcli() {
             || log_error "Failed to extract inner Unified_storcli_all_os.zip."
     fi
 
-    log_info "Installing storcli package..."
+    local pkg
     if [[ "$OS_FAMILY" == "rpm" ]]; then
-        local rpm_pkg
-        rpm_pkg=$(find "${tmpdir}" -name "storcli-*.noarch.rpm" | head -1)
-        [[ -n "$rpm_pkg" ]] || log_error "RPM package not found in archive."
-        rpm -ivh "$rpm_pkg" >> "$LOG_FILE" 2>&1 \
+        pkg=$(find "${tmpdir}" -name "storcli-*.noarch.rpm" | head -1)
+        [[ -n "$pkg" ]] || log_error "RPM package not found in archive."
+    else
+        pkg=$(find "${tmpdir}" -name "storcli_*_all.deb" | head -1)
+        [[ -n "$pkg" ]] || log_error "DEB package not found in archive."
+    fi
+
+    _install_storcli_pkg "$pkg"
+
+    rm -rf "$tmpdir"
+    trap - EXIT
+}
+
+# Internal helper: install a resolved .rpm or .deb package path
+_install_storcli_pkg() {
+    local pkg="$1"
+    log_info "Installing storcli package: $(basename "$pkg") ..."
+    if [[ "$OS_FAMILY" == "rpm" ]]; then
+        rpm -ivh "$pkg" >> "$LOG_FILE" 2>&1 \
             || log_error "rpm install failed."
     else
-        local deb_pkg
-        deb_pkg=$(find "${tmpdir}" -name "storcli_*_all.deb" | head -1)
-        [[ -n "$deb_pkg" ]] || log_error "DEB package not found in archive."
-        dpkg -i "$deb_pkg" >> "$LOG_FILE" 2>&1 \
+        dpkg -i "$pkg" >> "$LOG_FILE" 2>&1 \
             || log_error "dpkg install failed."
     fi
 
-    # Create symlink for convenience
+    # Create convenience symlink if the binary landed outside PATH
     if [[ -x "$STORCLI_BIN" ]] && ! command -v storcli64 &>/dev/null; then
         ln -sf "$STORCLI_BIN" /usr/local/sbin/storcli64
     fi
