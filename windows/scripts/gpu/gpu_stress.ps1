@@ -3,6 +3,13 @@
 # Description : GPU stress test for Windows servers — supports single/multi-GPU
 #               (up to 8 cards). Auto-selects gpu-burn or dcgmi engine.
 #               Compatible with H100/H800, A100/A800, RTX 4090/3090.
+#
+# Engines:
+#   gst    NVIDIA GPUStressTest — https://github.com/NVIDIA/GPUStressTest
+#          Requires: CUDA 12.x + Visual Studio 2022 to build
+#          Files needed: gst.exe + pthreadVC3.dll (place next to this script)
+#   dcgmi  NVIDIA DCGM — https://developer.nvidia.com/dcgm
+#          Best choice for H100/A100 on Windows Server
 # Usage       : .\gpu_stress.ps1 [OPTIONS]
 # Date        : 2026-03-16
 # =============================================================================
@@ -11,7 +18,7 @@
 param(
     [Alias('g')][string]  $Gpu        = '',      # comma-separated GPU indices, '' = all
     [Alias('d')][int]     $Duration   = 14400,   # seconds (4 hours)
-    [Alias('e')][ValidateSet('auto','gpu-burn','dcgmi')]
+    [Alias('e')][ValidateSet('auto','gst','dcgmi')]
                [string]  $Engine     = 'auto',
     [Alias('T')][int]     $TempLimit  = 85,      # °C warning threshold
                [switch]  $NoEccStop              # don't abort on ECC uncorrected error
@@ -30,7 +37,7 @@ $null = New-Item -ItemType Directory -Force -Path $ResultDir
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
 $NvSmiCmd    = ''
-$GpuBurnCmd  = ''
+$GstCmd      = ''    # NVIDIA GPUStressTest (gst.exe)
 $DcgmiCmd    = ''
 $EngineUsed  = ''
 $GpuList     = @()   # final list of GPU indices to stress
@@ -99,11 +106,13 @@ function Detect-Gpus {
 
 # ── Engine selection ──────────────────────────────────────────────────────────
 
-function Find-GpuBurn {
-    $local = Join-Path $ScriptDir 'gpu_burn.exe'
-    if (Test-Path $local) { $script:GpuBurnCmd = $local; return $true }
-    $cmd = Get-Command 'gpu_burn.exe' -ErrorAction SilentlyContinue
-    if ($cmd) { $script:GpuBurnCmd = $cmd.Source; return $true }
+function Find-Gst {
+    # gst.exe = NVIDIA GPUStressTest (https://github.com/NVIDIA/GPUStressTest)
+    # Place gst.exe (and pthreadVC3.dll) in the same directory as this script.
+    $local = Join-Path $ScriptDir 'gst.exe'
+    if (Test-Path $local) { $script:GstCmd = $local; return $true }
+    $cmd = Get-Command 'gst.exe' -ErrorAction SilentlyContinue
+    if ($cmd) { $script:GstCmd = $cmd.Source; return $true }
     return $false
 }
 
@@ -123,27 +132,33 @@ function Find-Dcgmi {
 function Select-Engine {
     switch ($Engine) {
         'auto' {
-            if (Find-GpuBurn) {
-                $script:EngineUsed = 'gpu-burn'
-                Log-Info "Engine: gpu-burn ($($script:GpuBurnCmd))"
-            } elseif (Find-Dcgmi) {
+            if (Find-Dcgmi) {
+                # dcgmi is preferred for H100/A100 data-center GPUs on Windows Server
                 $script:EngineUsed = 'dcgmi'
                 Log-Info "Engine: dcgmi ($($script:DcgmiCmd))"
+            } elseif (Find-Gst) {
+                $script:EngineUsed = 'gst'
+                Log-Info "Engine: NVIDIA GPUStressTest ($($script:GstCmd))"
             } else {
                 Log-Error @"
-No stress engine found.
-  gpu-burn  : Place gpu_burn.exe in $ScriptDir
-              (Build from https://github.com/wilicc/gpu-burn with CUDA toolkit)
-  dcgmi     : Install NVIDIA DCGM from https://developer.nvidia.com/dcgm
+No stress engine found. Install one of the following:
+
+  gst.exe   NVIDIA GPUStressTest (recommended, supports all NVIDIA GPUs)
+            Build: https://github.com/NVIDIA/GPUStressTest
+            Requires: CUDA 12.x + Visual Studio 2022
+            Place gst.exe and pthreadVC3.dll in: $ScriptDir
+
+  dcgmi.exe NVIDIA DCGM (best for H100/A100 on Windows Server)
+            Install: https://developer.nvidia.com/dcgm
 "@
             }
         }
-        'gpu-burn' {
-            if (Find-GpuBurn) {
-                $script:EngineUsed = 'gpu-burn'
-                Log-Info "Engine: gpu-burn ($($script:GpuBurnCmd))"
+        'gst' {
+            if (Find-Gst) {
+                $script:EngineUsed = 'gst'
+                Log-Info "Engine: NVIDIA GPUStressTest ($($script:GstCmd))"
             } else {
-                Log-Error "gpu_burn.exe not found. Place it in: $ScriptDir"
+                Log-Error "gst.exe not found. Place gst.exe + pthreadVC3.dll in: $ScriptDir"
             }
         }
         'dcgmi' {
@@ -151,7 +166,7 @@ No stress engine found.
                 $script:EngineUsed = 'dcgmi'
                 Log-Info "Engine: dcgmi ($($script:DcgmiCmd))"
             } else {
-                Log-Error "dcgmi.exe not found. Install NVIDIA DCGM."
+                Log-Error "dcgmi.exe not found. Install NVIDIA DCGM: https://developer.nvidia.com/dcgm"
             }
         }
     }
@@ -234,38 +249,45 @@ function Stop-Monitoring {
     }
 }
 
-# ── gpu-burn: one process per GPU (CUDA_VISIBLE_DEVICES binding) ──────────────
-function Run-GpuBurn {
-    $procs = @()
-    Log-Info "Launching gpu-burn on GPU(s): $($script:GpuList -join ', ')  Duration: ${Duration}s"
+# ── NVIDIA GPUStressTest: one process per GPU (CUDA_VISIBLE_DEVICES binding) ───
+#
+# gst.exe accepts -T=n (loop count, not duration). Since loop duration varies by
+# GPU model, we run with -T=9999 (effectively infinite) and terminate each process
+# after $Duration seconds via Start-Job timeout — same pattern as the Linux version.
+# Each instance sees only its own GPU via CUDA_VISIBLE_DEVICES.
+#
+function Run-Gst {
+    $jobs = @()
+    $gstBin = $script:GstCmd
+    Log-Info "Launching NVIDIA GPUStressTest on GPU(s): $($script:GpuList -join ', ')  Duration: ${Duration}s"
     Log-Sep
 
     foreach ($gid in $script:GpuList) {
-        Log-Info "  GPU${gid}: starting gpu-burn -d $Duration ..."
-        # CUDA_VISIBLE_DEVICES restricts visibility to the target card
-        $env:CUDA_VISIBLE_DEVICES = $gid
-        $proc = Start-Process -FilePath $script:GpuBurnCmd `
-            -ArgumentList "-d", "$Duration" `
-            -RedirectStandardOutput "$env:TEMP\gpuburn_${gid}_stdout.txt" `
-            -RedirectStandardError  "$env:TEMP\gpuburn_${gid}_stderr.txt" `
-            -PassThru -NoNewWindow
-        $procs += [pscustomobject]@{ Proc = $proc; GpuId = $gid }
+        Log-Info "  GPU${gid}: starting gst.exe -T=9999 (will run for ${Duration}s then stop)..."
+        $logPath = $LogFile
+        $job = Start-Job -ScriptBlock {
+            param([string]$GstBin, [string]$GpuId, [string]$LogPath)
+            $env:CUDA_VISIBLE_DEVICES = $GpuId
+            # Redirect stdout/stderr to temp files, then append to shared log
+            $out = & $GstBin -T=9999 2>&1 | Out-String
+            "=== gst.exe GPU${GpuId} output ===`n$out" | Add-Content -Path $LogPath
+        } -ArgumentList $gstBin, $gid, $logPath
+
+        $jobs += [pscustomobject]@{ Job = $job; GpuId = $gid }
     }
-    $env:CUDA_VISIBLE_DEVICES = ''
 
-    # Wait for all and collect results
-    foreach ($p in $procs) {
-        $p.Proc.WaitForExit()
-        $stdout = Get-Content "$env:TEMP\gpuburn_$($p.GpuId)_stdout.txt" -ErrorAction SilentlyContinue | Out-String
-        $stderr = Get-Content "$env:TEMP\gpuburn_$($p.GpuId)_stderr.txt" -ErrorAction SilentlyContinue | Out-String
-        "=== gpu-burn GPU$($p.GpuId) stdout ===`n$stdout`n=== stderr ===`n$stderr" | Add-Content $LogFile
+    # Wait for Duration seconds, then stop all workers
+    $null = Wait-Job -Job ($jobs | ForEach-Object { $_.Job }) -Timeout $Duration
 
-        if ($p.Proc.ExitCode -ne 0) {
-            Log-Warn "GPU$($p.GpuId): gpu-burn exited with code $($p.Proc.ExitCode)"
+    foreach ($j in $jobs) {
+        if ($j.Job.State -eq 'Running') {
+            Stop-Job $j.Job -ErrorAction SilentlyContinue
+            Log-Info "  GPU$($j.GpuId): stopped after ${Duration}s"
+        } elseif ($j.Job.State -eq 'Failed') {
+            Log-Warn "  GPU$($j.GpuId): gst.exe job failed"
             $script:OverallPass = $false
         }
-        Remove-Item "$env:TEMP\gpuburn_$($p.GpuId)_stdout.txt" -ErrorAction SilentlyContinue
-        Remove-Item "$env:TEMP\gpuburn_$($p.GpuId)_stderr.txt" -ErrorAction SilentlyContinue
+        Remove-Job $j.Job -ErrorAction SilentlyContinue
     }
 }
 
@@ -355,8 +377,8 @@ try {
     Start-Monitoring
 
     switch ($EngineUsed) {
-        'gpu-burn' { Run-GpuBurn }
-        'dcgmi'    { Run-Dcgmi   }
+        'gst'   { Run-Gst   }
+        'dcgmi' { Run-Dcgmi }
     }
 
     Stop-Monitoring
